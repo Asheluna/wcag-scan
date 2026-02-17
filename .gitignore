@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Generated reports
+*.html
+!src/**/*.html
+
+# Screenshots and images from test runs
+*.png
+*.jpg
+*.jpeg
+
+# Tesseract trained data (large binary, install via tesseract.js)
+eng.traineddata
+
+# Playwright MCP
+.playwright-mcp/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/

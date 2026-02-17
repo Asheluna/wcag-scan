@@ -1,0 +1,24 @@
+{
+  "name": "wcag-scan",
+  "version": "1.0.0",
+  "description": "WCAG 2.2 compliance scanner — crawl websites and generate accessibility reports",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "wcag-scan": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "scan": "node src/index.js scan"
+  },
+  "keywords": ["wcag", "accessibility", "a11y", "scanner", "compliance"],
+  "license": "MIT",
+  "dependencies": {
+    "@axe-core/puppeteer": "^4.10.0",
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0",
+    "ora": "^8.1.0",
+    "puppeteer": "^23.0.0",
+    "tesseract.js": "^5.1.0"
+  }
+}
