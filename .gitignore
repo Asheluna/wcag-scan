@@ -2,16 +2,13 @@
 node_modules/
 
 # Generated reports
-*.html
-!src/**/*.html
+reports/
 
-# Screenshots and images from test runs
-*.png
-*.jpg
-*.jpeg
+# Screenshots
+screenshots/
 
-# Tesseract trained data (large binary, install via tesseract.js)
-eng.traineddata
+# Scan history data
+data/
 
 # Playwright MCP
 .playwright-mcp/

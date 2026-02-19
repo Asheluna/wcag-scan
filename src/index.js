@@ -8,13 +8,7 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
-import puppeteer from 'puppeteer';
-import { crawl } from './crawler.js';
-import { scanPages } from './scanner.js';
-import { analyzeAllPages } from './imageAnalyzer.js';
-import { runAllCustomChecks } from './customChecks.js';
-import { generateHtmlReport, writeHtmlReport, writePdfReport } from './reporter.js';
-import path from 'path';
+import { executeScan } from './scanEngine.js';
 
 // Suppress unhandled rejections from Puppeteer cleanup
 process.on('unhandledRejection', (reason) => {
@@ -40,13 +34,15 @@ program
     .option('--depth <number>', 'Maximum crawl depth', (v) => parseInt(v, 10), 3)
     .option('--max-pages <number>', 'Maximum pages to scan', (v) => parseInt(v, 10), 25)
     .option('--level <level>', 'WCAG conformance level (A, AA, AAA)', 'AA')
-    .option('--output <file>', 'Output file path', 'wcag-report.html')
+    .option('--output <file>', 'Output file path', 'reports/wcag-report.html')
     .option('--format <format>', 'Output format (html, pdf)', 'html')
     .option('--brand-name <name>', 'Brand name for PDF header')
     .option('--brand-logo <path>', 'Path to logo image for PDF header')
     .option('--skip-images', 'Skip image text analysis', false)
+    .option('--llama-url <url>', 'llama-server base URL', 'http://192.168.50.107:8080')
+    .option('--model <name>', 'VLM model name for image analysis', 'qwen3vl-8b-instruct')
     .action(async (opts) => {
-        await runScan({
+        await runCliScan({
             mode: 'full',
             urls: [opts.url],
             depth: opts.depth,
@@ -57,6 +53,8 @@ program
             brandName: opts.brandName,
             brandLogo: opts.brandLogo,
             skipImages: opts.skipImages,
+            llamaUrl: opts.llamaUrl,
+            model: opts.model,
         });
     });
 
@@ -67,11 +65,13 @@ program
     .description('Custom scan — scan up to 10 specific URLs')
     .requiredOption('--urls <urls>', 'Comma-separated list of URLs to scan (max 10)')
     .option('--level <level>', 'WCAG conformance level (A, AA, AAA)', 'AA')
-    .option('--output <file>', 'Output file path', 'wcag-report.html')
+    .option('--output <file>', 'Output file path', 'reports/wcag-report.html')
     .option('--format <format>', 'Output format (html, pdf)', 'html')
     .option('--brand-name <name>', 'Brand name for PDF header')
     .option('--brand-logo <path>', 'Path to logo image for PDF header')
     .option('--skip-images', 'Skip image text analysis', false)
+    .option('--llama-url <url>', 'llama-server base URL', 'http://192.168.50.107:8080')
+    .option('--model <name>', 'VLM model name for image analysis', 'qwen3vl-8b-instruct')
     .action(async (opts) => {
         const urls = opts.urls.split(',').map(u => u.trim()).filter(Boolean);
         if (urls.length === 0) {
@@ -82,7 +82,7 @@ program
             console.error(chalk.red('Error: Maximum 10 URLs allowed in custom scan mode.'));
             process.exit(1);
         }
-        await runScan({
+        await runCliScan({
             mode: 'custom',
             urls,
             level: opts.level,
@@ -91,152 +91,76 @@ program
             brandName: opts.brandName,
             brandLogo: opts.brandLogo,
             skipImages: opts.skipImages,
+            llamaUrl: opts.llamaUrl,
+            model: opts.model,
         });
     });
 
-// ── Main Scan Orchestrator ──────────────────────────────────────────────────
+// ── Dashboard ───────────────────────────────────────────────────────────────
 
-async function runScan(config) {
-    const {
-        mode, urls, depth, maxPages, level, output, format,
-        brandName, brandLogo, skipImages,
-    } = config;
+program
+    .command('dashboard')
+    .description('Start the web dashboard for managing scans')
+    .option('--port <number>', 'Port to listen on', (v) => parseInt(v, 10), 3000)
+    .action(async (opts) => {
+        const { startDashboard } = await import('./dashboard/server.js');
+        await startDashboard({ port: opts.port });
+    });
 
+// ── CLI Scan Wrapper ────────────────────────────────────────────────────────
+
+async function runCliScan(config) {
     console.log('');
     console.log(chalk.bold.hex('#818cf8')('  ╔══════════════════════════════════════╗'));
     console.log(chalk.bold.hex('#818cf8')('  ║      WCAG 2.2 Compliance Scanner     ║'));
     console.log(chalk.bold.hex('#818cf8')('  ╚══════════════════════════════════════╝'));
     console.log('');
-    console.log(chalk.gray(`  Mode:     ${mode === 'full' ? 'Full Site Scan' : 'Custom URL Scan'}`));
-    console.log(chalk.gray(`  Level:    WCAG 2.2 Level ${level}`));
-    console.log(chalk.gray(`  Output:   ${output} (${format.toUpperCase()})`));
-    if (mode === 'full') {
-        console.log(chalk.gray(`  Depth:    ${depth} | Max Pages: ${maxPages}`));
+    console.log(chalk.gray(`  Mode:     ${config.mode === 'full' ? 'Full Site Scan' : 'Custom URL Scan'}`));
+    console.log(chalk.gray(`  Level:    WCAG 2.2 Level ${config.level}`));
+    console.log(chalk.gray(`  Output:   ${config.output} (${config.format.toUpperCase()})`));
+    if (config.mode === 'full') {
+        console.log(chalk.gray(`  Depth:    ${config.depth} | Max Pages: ${config.maxPages}`));
     } else {
-        console.log(chalk.gray(`  URLs:     ${urls.length}`));
+        console.log(chalk.gray(`  URLs:     ${config.urls.length}`));
     }
     console.log('');
 
-    // Launch browser
-    const spinner = ora({ text: 'Launching browser...', color: 'cyan' }).start();
-    let browser;
+    let spinner = ora({ text: 'Starting...', color: 'cyan' }).start();
 
-    try {
-        browser = await puppeteer.launch({
-            headless: 'new',
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-        });
-        spinner.succeed('Browser launched');
-
-        // ── Step 1: Discover URLs ──────────────────────────────────
-        let pagesToScan;
-
-        if (mode === 'full') {
-            const crawlSpinner = ora({ text: `Crawling ${urls[0]}...`, color: 'cyan' }).start();
-            pagesToScan = await crawl(browser, urls[0], {
-                maxDepth: depth,
-                maxPages: maxPages,
-                onPageFound: (url, count, error) => {
-                    if (error) {
-                        crawlSpinner.text = chalk.yellow(`  [${count}] Error: ${url}`);
-                    } else {
-                        crawlSpinner.text = `  Discovered ${count} page${count > 1 ? 's' : ''}... ${chalk.gray(url)}`;
-                    }
-                },
-            });
-            crawlSpinner.succeed(`Discovered ${pagesToScan.length} page${pagesToScan.length > 1 ? 's' : ''}`);
-        } else {
-            pagesToScan = urls;
-            console.log(chalk.green(`  ✓ ${pagesToScan.length} URL${pagesToScan.length > 1 ? 's' : ''} to scan`));
-        }
-
-        if (pagesToScan.length === 0) {
-            spinner.fail('No pages found to scan.');
-            await browser.close().catch(() => { });
-            return;
-        }
-
-        // ── Step 2: WCAG Scan ──────────────────────────────────────
-        const scanSpinner = ora({ text: 'Running WCAG analysis...', color: 'cyan' }).start();
-        const scanResults = await scanPages(browser, pagesToScan, {
-            level,
-            onPageScanned: (url, idx, total, result) => {
-                const violations = result.violations?.length || 0;
-                const status = violations > 0
-                    ? chalk.red(`${violations} violations`)
-                    : chalk.green('✓ passed');
-                scanSpinner.text = `  [${idx}/${total}] ${status} ${chalk.gray(url)}`;
-            },
-        });
-        const totalViolations = scanResults.reduce((s, r) => s + (r.violations?.length || 0), 0);
-        scanSpinner.succeed(`WCAG analysis complete — ${totalViolations} violation${totalViolations !== 1 ? 's' : ''} found`);
-
-        // ── Step 3: Custom WCAG Checks ──────────────────────────────
-        const customSpinner = ora({ text: 'Running custom WCAG checks...', color: 'cyan' }).start();
-        const customResults = await runAllCustomChecks(browser, pagesToScan, (url, idx, total) => {
-            customSpinner.text = `  [${idx}/${total}] Custom checks... ${chalk.gray(url)}`;
-        });
-        const customViolations = customResults.perPage.reduce((s, r) =>
-            s + (r.findings?.filter(f => f.status === 'violation').length || 0), 0);
-        const customWarnings = customResults.perPage.reduce((s, r) =>
-            s + (r.findings?.filter(f => f.status === 'warning').length || 0), 0);
-        customSpinner.succeed(`Custom checks complete — ${customViolations} violation${customViolations !== 1 ? 's' : ''}, ${customWarnings} warning${customWarnings !== 1 ? 's' : ''}`);
-
-        // ── Step 4: Image Analysis ─────────────────────────────────
-        let imageResults = null;
-        if (!skipImages) {
-            const imgSpinner = ora({ text: 'Analyzing images and media...', color: 'cyan' }).start();
-            imageResults = await analyzeAllPages(browser, pagesToScan, (url, idx, total) => {
-                imgSpinner.text = `  [${idx}/${total}] Analyzing media... ${chalk.gray(url)}`;
-            });
-            const totalFindings = imageResults.reduce((s, r) => s + (r.findings?.length || 0), 0);
-            imgSpinner.succeed(`Media analysis complete — ${totalFindings} finding${totalFindings !== 1 ? 's' : ''}`);
-        }
-
-        // ── Step 5: Generate Report ────────────────────────────────
-        const reportSpinner = ora({ text: 'Generating report...', color: 'cyan' }).start();
-
-        const htmlContent = generateHtmlReport(scanResults, imageResults, customResults, {
-            targetUrl: urls[0],
-            level,
-            scanMode: mode,
-            brandName,
-            brandLogo,
-        });
-
-        let outputPath = path.resolve(output);
-
-        if (format === 'pdf') {
-            if (!outputPath.endsWith('.pdf')) {
-                outputPath = outputPath.replace(/\.html$/, '') + '.pdf';
+    const result = await executeScan(config, {
+        onPhase: (phase, message) => {
+            // Update spinner for each phase
+            if (phase === 'report' && message.startsWith('Report saved')) {
+                spinner.succeed(message);
+            } else if (phase === 'images' && message.includes('not available')) {
+                spinner.warn(chalk.yellow(message));
+                spinner = ora({ text: '', color: 'cyan' }).start();
+            } else {
+                spinner.succeed(message);
+                spinner = ora({ text: '', color: 'cyan' }).start();
             }
-            await writePdfReport(browser, htmlContent, outputPath, { brandName, brandLogo });
-        } else {
-            await writeHtmlReport(htmlContent, outputPath);
-        }
+        },
+        onProgress: (phase, current, total, detail) => {
+            spinner.text = `  [${current}/${total}] ${detail}`;
+        },
+    });
 
-        reportSpinner.succeed(`Report saved to ${chalk.bold(outputPath)}`);
+    if (spinner.isSpinning) spinner.stop();
 
-        // ── Summary ────────────────────────────────────────────────
-        console.log('');
-        const totalPasses = scanResults.reduce((s, r) => s + (r.passes?.length || 0), 0);
-        console.log(chalk.bold('  Summary:'));
-        console.log(`    Pages scanned:  ${chalk.bold(scanResults.length)}`);
-        console.log(`    Violations:     ${totalViolations > 0 ? chalk.red.bold(totalViolations) : chalk.green.bold(0)}`);
-        console.log(`    Passed rules:   ${chalk.green.bold(totalPasses)}`);
-        console.log(`    Custom checks:  ${customViolations > 0 ? chalk.red.bold(customViolations + ' violations') : chalk.green.bold('0 violations')}, ${customWarnings > 0 ? chalk.yellow.bold(customWarnings + ' warnings') : chalk.green.bold('0 warnings')}`);
-        if (imageResults) {
-            const imgViolations = imageResults.reduce((s, r) => s + (r.findings?.filter(f => f.status === 'violation').length || 0), 0);
-            console.log(`    Media issues:   ${imgViolations > 0 ? chalk.yellow.bold(imgViolations) : chalk.green.bold(0)}`);
-        }
-        console.log('');
-
-        await browser.close().catch(() => { });
-    } catch (err) {
-        spinner.fail(chalk.red(`Error: ${err.message}`));
-        if (browser) await browser.close().catch(() => { });
+    if (!result.success) {
+        console.error(chalk.red(`  Error: ${result.error}`));
         process.exit(1);
     }
+
+    // Print summary
+    const s = result.summary;
+    const c = s.criteria;
+    console.log('');
+    console.log(chalk.bold('  Summary:'));
+    console.log(`    Pages scanned:  ${chalk.bold(s.pagesScanned)}`);
+    console.log(`    Criteria:       ${chalk.green.bold(c.passed)}/${chalk.bold(c.total)} passed  ${c.failed > 0 ? chalk.red.bold(c.failed + ' failed') : ''}  ${c.review > 0 ? chalk.yellow.bold(c.review + ' needs review') : ''}`);
+    console.log(`    Score:          ${c.score >= 80 ? chalk.green.bold(c.score + '%') : c.score >= 50 ? chalk.yellow.bold(c.score + '%') : chalk.red.bold(c.score + '%')}`);
+    console.log('');
 }
 
 program.parse();

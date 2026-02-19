@@ -43,6 +43,39 @@ export async function scanPage(browser, url, options = {}) {
             .withTags(tags)
             .analyze();
 
+        // Tag nodes that are inside shared regions (site-wide header/footer)
+        // so the reporter can deduplicate them across pages
+        const allSelectors = new Set();
+        for (const cat of ['violations', 'passes', 'incomplete', 'inapplicable']) {
+            for (const rule of results[cat] || []) {
+                for (const node of rule.nodes || []) {
+                    if (node.target?.[0]) allSelectors.add(node.target[0]);
+                }
+            }
+        }
+        if (allSelectors.size > 0) {
+            const sharedMap = await page.evaluate((sels) => {
+                const map = {};
+                for (const sel of sels) {
+                    try {
+                        const el = document.querySelector(sel);
+                        if (!el) { map[sel] = false; continue; }
+                        if (el.closest('[role="banner"], [role="contentinfo"]')) { map[sel] = true; continue; }
+                        const shared = el.closest('header, footer, nav');
+                        map[sel] = shared ? !shared.closest('article, section, aside, main') : false;
+                    } catch { map[sel] = false; }
+                }
+                return map;
+            }, [...allSelectors]);
+            for (const cat of ['violations', 'passes', 'incomplete', 'inapplicable']) {
+                for (const rule of results[cat] || []) {
+                    for (const node of rule.nodes || []) {
+                        node.inSharedRegion = sharedMap[node.target?.[0]] || false;
+                    }
+                }
+            }
+        }
+
         // Capture screenshots for violation nodes (max 2 per rule)
         for (const violation of results.violations || []) {
             for (const node of violation.nodes.slice(0, 2)) {

@@ -1,26 +1,62 @@
 /**
- * Image Analyzer — OCR-based text detection for WCAG 1.4.5 compliance.
+ * Image Analyzer — VLM-based image analysis for WCAG compliance.
+ * Uses a local llama-server with a vision model to analyze images on web pages.
  * Also checks video/audio elements for text alternatives.
  */
 
-import Tesseract from 'tesseract.js';
-import { screenshotElement } from './customChecks.js';
+import { LlamaClient } from './llamaClient.js';
+
+const VLM_PROMPT = `Analyze this web page image for accessibility compliance. Return ONLY valid JSON matching this exact schema:
+{
+  "description": "Brief objective description of what the image shows",
+  "containsText": true or false,
+  "detectedText": "Any text visible in the image, or null if none",
+  "isDecorative": true or false,
+  "decorativeReason": "Why it might be decorative (pattern, spacer, border), or null",
+  "contentType": "photo|illustration|icon|chart|logo|screenshot|other"
+}
+Rules:
+- Be factual and concise. Do not hallucinate.
+- If uncertain about text, set containsText to false.
+- description should be 1-2 sentences max.
+- Output ONLY the JSON object, no other text.`;
 
 /**
- * Extract image elements from a page and analyze them for text content.
+ * Parse the VLM JSON response, handling common quirks.
+ */
+function parseVlmResponse(raw) {
+    try {
+        return JSON.parse(raw);
+    } catch {
+        // Try extracting first { ... } block
+        const match = raw.match(/\{[\s\S]*\}/);
+        if (match) {
+            try {
+                return JSON.parse(match[0]);
+            } catch { /* fall through */ }
+        }
+        return null;
+    }
+}
+
+/**
+ * Extract image elements from a page and analyze them with VLM.
  *
  * @param {import('puppeteer').Browser} browser
  * @param {string} url
+ * @param {object} [options]
+ * @param {LlamaClient} [options.llamaClient]
  * @returns {Promise<object>} Image analysis results
  */
-export async function analyzePageImages(browser, url) {
+export async function analyzePageImages(browser, url, options = {}) {
+    const { llamaClient } = options;
     const page = await browser.newPage();
     const findings = [];
 
     try {
         await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
 
-        // Inject selector helper for screenshot targeting
+        // Inject selector helper and shared-region detection
         await page.evaluate(() => {
             window.__getSelector = function(el) {
                 if (!el || el === document.body) return 'body';
@@ -32,82 +68,132 @@ export async function analyzePageImages(browser, url) {
                 }
                 return 'body > ' + path.join(' > ');
             };
+            window.__isInSharedRegion = function(el) {
+                if (el.closest('[role="banner"], [role="contentinfo"]')) return true;
+                const shared = el.closest('header, footer, nav');
+                return shared ? !shared.closest('article, section, aside, main') : false;
+            };
         });
 
-        // Extract all images with their attributes
+        // Extract only <img> elements (and check for <figure>/<figcaption> context)
         const images = await page.evaluate(() => {
-            return Array.from(document.querySelectorAll('img')).map(img => ({
-                src: img.src,
-                alt: img.alt || null,
-                ariaLabel: img.getAttribute('aria-label') || null,
-                ariaLabelledBy: img.getAttribute('aria-labelledby') || null,
-                role: img.getAttribute('role') || null,
-                width: img.naturalWidth || img.width,
-                height: img.naturalHeight || img.height,
-                isVisible: img.offsetParent !== null,
-                selector: __getSelector(img),
-            }));
+            return Array.from(document.querySelectorAll('img')).map(img => {
+                // Check if img is inside a <figure> with a <figcaption>
+                const figure = img.closest('figure');
+                const figcaption = figure?.querySelector('figcaption');
+                const figcaptionText = figcaption?.textContent?.trim() || null;
+
+                return {
+                    src: img.src,
+                    alt: img.getAttribute('alt'),  // null if missing, "" if empty — important distinction
+                    ariaLabel: img.getAttribute('aria-label') || null,
+                    ariaLabelledBy: img.getAttribute('aria-labelledby') || null,
+                    role: img.getAttribute('role') || null,
+                    figcaptionText,                // text from parent <figure>'s <figcaption>
+                    width: img.naturalWidth || img.width,
+                    height: img.naturalHeight || img.height,
+                    isVisible: img.offsetParent !== null,
+                    selector: __getSelector(img),
+                    inSharedRegion: __isInSharedRegion(img),
+                };
+            });
         });
 
         // Filter to visible images of meaningful size (skip tiny icons/spacers)
-        // Also skip SVGs and data URIs that Tesseract can't process
+        // Also skip SVGs and data URIs that VLM can't meaningfully analyze
         const meaningfulImages = images.filter(
             img => img.isVisible && img.src && img.width > 50 && img.height > 20
                 && !img.src.endsWith('.svg')
                 && !img.src.startsWith('data:image/svg')
-        ).slice(0, 10); // Limit to 10 images per page for performance
+        ).slice(0, 10); // Limit to 10 images per page
 
-        // Create a Tesseract worker for this page
-        let worker = null;
-        try {
-            worker = await Tesseract.createWorker('eng', 1, {
-                logger: () => { },
-            });
-        } catch {
-            // If we can't create a worker, skip OCR entirely
-            worker = null;
-        }
-
-        // OCR each image to detect text
-        if (worker) {
+        // Analyze each image with VLM
+        if (llamaClient) {
             for (const img of meaningfulImages) {
+                const altText = (img.alt ?? '').trim();
+                const hasAlt = altText.length > 0;
+                const hasAriaLabel = Boolean(img.ariaLabel?.trim());
+                const hasFigcaption = Boolean(img.figcaptionText);
+                const hasTextAlternative = hasAlt || hasAriaLabel || hasFigcaption;
+                const hasExplicitEmptyAlt = img.alt !== null && img.alt.trim() === '';
+                const isMarkedDecorative = img.role === 'presentation' || img.role === 'none' || hasExplicitEmptyAlt;
+
+                // Skip VLM analysis for images explicitly marked as decorative
+                if (isMarkedDecorative) continue;
+
                 try {
-                    const { data } = await worker.recognize(img.src);
+                    // Fetch the actual image source instead of screenshotting the
+                    // rendered element — avoids capturing adjacent text/elements
+                    // that may overlap due to CSS layout.
+                    let imgBase64;
+                    try {
+                        imgBase64 = await page.evaluate(async (src) => {
+                            const res = await fetch(src);
+                            if (!res.ok) return null;
+                            const blob = await res.blob();
+                            return new Promise((resolve) => {
+                                const reader = new FileReader();
+                                reader.onloadend = () => resolve(reader.result.split(',')[1]);
+                                reader.readAsDataURL(blob);
+                            });
+                        }, img.src);
+                    } catch {
+                        // Fallback to element screenshot if fetch fails (e.g. CORS)
+                        const elementHandle = await page.$(img.selector);
+                        if (!elementHandle) continue;
+                        try {
+                            imgBase64 = await elementHandle.screenshot({ encoding: 'base64' });
+                        } catch {
+                            continue;
+                        }
+                    }
 
-                    const detectedText = data.text?.trim() || '';
-                    const confidence = data.confidence || 0;
+                    if (!imgBase64) continue;
 
-                    // Only flag if we detect text with reasonable confidence
-                    if (detectedText.length > 2 && confidence > 50) {
-                        const altText = img.alt?.trim() || '';
-                        const hasAlt = Boolean(altText);
-                        const hasAriaLabel = Boolean(img.ariaLabel?.trim());
-                        const isDecorative = img.role === 'presentation' || img.role === 'none';
+                    // Use the fetched image as the evidence screenshot (not the
+                    // rendered element which can include adjacent page content)
+                    const imgScreenshot = `data:image/png;base64,${imgBase64}`;
 
+                    // Call VLM
+                    const rawResponse = await llamaClient.complete(VLM_PROMPT, {
+                        imageBase64: imgBase64,
+                    });
+
+                    const vlm = parseVlmResponse(rawResponse);
+                    if (!vlm) continue;
+
+                    const vlmDescription = vlm.description || '';
+                    const containsText = vlm.containsText === true;
+                    const detectedText = vlm.detectedText || null;
+                    const vlmIsDecorative = vlm.isDecorative === true;
+                    const contentType = vlm.contentType || 'other';
+
+                    // ── WCAG 1.4.5: Images of Text ──
+                    if (containsText && detectedText) {
                         let status = 'pass';
                         let message = '';
 
-                        if (isDecorative) {
-                            status = 'warning';
-                            message = `Image marked as decorative (role="${img.role}") but contains text: "${detectedText}". Verify this is intentional.`;
-                        } else if (!hasAlt && !hasAriaLabel) {
+                        if (!hasTextAlternative) {
                             status = 'violation';
-                            message = `Image contains text "${detectedText}" but has no alt text or aria-label. WCAG 1.4.5 requires text alternatives for images of text.`;
+                            message = `Image contains text "${detectedText}" but has no alt text, aria-label, or figcaption. WCAG 1.4.5 requires text alternatives for images of text.`;
                         } else if (hasAlt) {
-                            const altLower = altText.toLowerCase();
-                            const detectedLower = detectedText.toLowerCase().replace(/\s+/g, ' ');
-                            const similarity = calculateTextSimilarity(altLower, detectedLower);
-
+                            const similarity = calculateTextSimilarity(
+                                altText.toLowerCase(),
+                                detectedText.toLowerCase().replace(/\s+/g, ' ')
+                            );
                             if (similarity < 0.3) {
                                 status = 'warning';
                                 message = `Image contains text "${detectedText}" but alt text "${altText}" may not adequately describe it (${Math.round(similarity * 100)}% similarity).`;
                             } else {
                                 status = 'pass';
-                                message = `Image text "${detectedText}" is represented in alt text "${altText}".`;
+                                message = `Image text "${detectedText}" is represented in alt text.`;
                             }
                         } else {
+                            // Has aria-label or figcaption
                             status = 'pass';
-                            message = `Image has an aria-label as text alternative.`;
+                            message = hasFigcaption
+                                ? `Image has a figcaption as text alternative.`
+                                : `Image has an aria-label as text alternative.`;
                         }
 
                         findings.push({
@@ -115,20 +201,86 @@ export async function analyzePageImages(browser, url) {
                             src: img.src,
                             detectedText,
                             altText: img.alt,
-                            confidence: Math.round(confidence),
+                            confidence: 100,
                             status,
                             message,
                             wcagCriteria: '1.4.5',
                             wcagName: 'Images of Text',
                             selector: img.selector,
+                            inSharedRegion: img.inSharedRegion,
+                            screenshot: status !== 'pass' ? imgScreenshot : undefined,
+                            vlmDescription,
+                            contentType,
                         });
                     }
+
+                    // ── WCAG 1.1.1: Non-text Content ──
+                    if (!hasTextAlternative) {
+                        // No text alternative at all
+                        if (vlmIsDecorative) {
+                            findings.push({
+                                type: 'image',
+                                src: img.src,
+                                detectedText: null,
+                                altText: img.alt,
+                                confidence: 100,
+                                status: 'warning',
+                                message: `Image appears decorative (${vlm.decorativeReason || 'visual pattern'}) but is not marked with role="presentation", role="none", or alt="". Consider adding an empty alt="" or a role attribute.`,
+                                wcagCriteria: '1.1.1',
+                                wcagName: 'Non-text Content',
+                                selector: img.selector,
+                                inSharedRegion: img.inSharedRegion,
+                                screenshot: imgScreenshot,
+                                vlmDescription,
+                                contentType,
+                            });
+                        } else {
+                            findings.push({
+                                type: 'image',
+                                src: img.src,
+                                detectedText: null,
+                                altText: img.alt,
+                                confidence: 100,
+                                status: 'violation',
+                                message: `Image has no alt text, aria-label, or figcaption. The image shows: ${vlmDescription || 'content that should be described'}.`,
+                                wcagCriteria: '1.1.1',
+                                wcagName: 'Non-text Content',
+                                selector: img.selector,
+                                inSharedRegion: img.inSharedRegion,
+                                screenshot: imgScreenshot,
+                                vlmDescription,
+                                contentType,
+                            });
+                        }
+                    } else if (hasAlt && vlmDescription) {
+                        // Has alt text — check quality against VLM description
+                        const similarity = calculateTextSimilarity(
+                            altText.toLowerCase(),
+                            vlmDescription.toLowerCase()
+                        );
+                        if (similarity < 0.15 && altText.length < 10) {
+                            findings.push({
+                                type: 'image',
+                                src: img.src,
+                                detectedText: null,
+                                altText: img.alt,
+                                confidence: 100,
+                                status: 'warning',
+                                message: `Alt text "${altText}" may not adequately describe the image. The image shows: ${vlmDescription}.`,
+                                wcagCriteria: '1.1.1',
+                                wcagName: 'Non-text Content',
+                                selector: img.selector,
+                                inSharedRegion: img.inSharedRegion,
+                                screenshot: imgScreenshot,
+                                vlmDescription,
+                                contentType,
+                            });
+                        }
+                    }
                 } catch {
-                    // Skip images we can't OCR (CORS, broken, unsupported format, etc.)
+                    // Skip images that fail VLM analysis (timeout, encoding issue, etc.)
                 }
             }
-
-            try { await worker.terminate(); } catch { /* ignore */ }
         }
 
         // Check video elements for text alternatives
@@ -142,6 +294,7 @@ export async function analyzePageImages(browser, url) {
                 ariaLabel: video.getAttribute('aria-label') || null,
                 title: video.getAttribute('title') || null,
                 selector: __getSelector(video),
+                inSharedRegion: __isInSharedRegion(video),
             }));
         });
 
@@ -158,6 +311,7 @@ export async function analyzePageImages(browser, url) {
                     wcagCriteria: '1.2.2',
                     wcagName: 'Captions (Prerecorded)',
                     selector: video.selector,
+                    inSharedRegion: video.inSharedRegion,
                 });
             }
         }
@@ -169,6 +323,7 @@ export async function analyzePageImages(browser, url) {
                 ariaLabel: audio.getAttribute('aria-label') || null,
                 title: audio.getAttribute('title') || null,
                 selector: __getSelector(audio),
+                inSharedRegion: __isInSharedRegion(audio),
             }));
         });
 
@@ -185,21 +340,8 @@ export async function analyzePageImages(browser, url) {
                     wcagCriteria: '1.2.1',
                     wcagName: 'Audio-only and Video-only (Prerecorded)',
                     selector: audio.selector,
+                    inSharedRegion: audio.inSharedRegion,
                 });
-            }
-        }
-
-        // Capture screenshots for non-pass findings (max 3)
-        let screenshotCount = 0;
-        for (const f of findings) {
-            if (screenshotCount >= 3) break;
-            if (f.status !== 'pass' && f.selector) {
-                try {
-                    f.screenshot = await screenshotElement(page, f.selector);
-                    if (f.screenshot) screenshotCount++;
-                } catch {
-                    // Skip if screenshot fails
-                }
             }
         }
 
@@ -232,13 +374,24 @@ function calculateTextSimilarity(a, b) {
  *
  * @param {import('puppeteer').Browser} browser
  * @param {string[]} urls
- * @param {function} onPageAnalyzed - (url, index, total) callback
+ * @param {object} [options]
+ * @param {string} [options.llamaUrl] - llama-server base URL
+ * @param {string} [options.model] - VLM model name
+ * @param {function} [options.onPageAnalyzed] - (url, index, total, result) callback
  * @returns {Promise<object[]>}
  */
-export async function analyzeAllPages(browser, urls, onPageAnalyzed) {
+export async function analyzeAllPages(browser, urls, options = {}) {
+    const { llamaUrl, model, onPageAnalyzed } = options;
+
+    // Create llama client if URL is provided
+    let llamaClient = null;
+    if (llamaUrl) {
+        llamaClient = new LlamaClient({ baseUrl: llamaUrl, model: model || '' });
+    }
+
     const results = [];
     for (let i = 0; i < urls.length; i++) {
-        const result = await analyzePageImages(browser, urls[i]);
+        const result = await analyzePageImages(browser, urls[i], { llamaClient });
         results.push(result);
         if (onPageAnalyzed) onPageAnalyzed(urls[i], i + 1, urls.length, result);
     }

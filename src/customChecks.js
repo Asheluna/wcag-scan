@@ -1079,9 +1079,13 @@ async function checkNoKeyboardTrap(page) {
 
         for (let i = 0; i < maxTabs; i++) {
             await page.keyboard.press('Tab');
-            const activeTag = await page.evaluate(() => {
+            const { tag: activeTag, selector: activeSelector } = await page.evaluate(() => {
                 const el = document.activeElement;
-                return el ? `${el.tagName}#${el.id || ''}` : 'body';
+                if (!el) return { tag: 'body', selector: null };
+                return {
+                    tag: `${el.tagName}#${el.id || ''}`,
+                    selector: typeof __getSelector === 'function' ? __getSelector(el) : null,
+                };
             });
             focusHistory.push(activeTag);
 
@@ -1094,6 +1098,7 @@ async function checkNoKeyboardTrap(page) {
                         status: 'violation',
                         message: `Potential keyboard trap detected: focus stuck on ${activeTag} after ${consecutiveSame} Tab presses.`,
                         impact: 'critical',
+                        selector: activeSelector,
                     });
                     break;
                 }
@@ -1133,17 +1138,22 @@ async function checkMultipleWays(page) {
         const findings = [];
         let wayCount = 0;
         const ways = [];
+        let targetEl = null;
 
         // Check for navigation menu
-        if (document.querySelector('nav, [role="navigation"]')) {
+        const navEl = document.querySelector('nav, [role="navigation"]');
+        if (navEl) {
             wayCount++;
             ways.push('navigation menu');
+            if (!targetEl) targetEl = navEl;
         }
 
         // Check for search
-        if (document.querySelector('[role="search"], input[type="search"], form[action*="search"], [class*="search"] input, [id*="search"] input')) {
+        const searchEl = document.querySelector('[role="search"], input[type="search"], form[action*="search"], [class*="search"] input, [id*="search"] input');
+        if (searchEl) {
             wayCount++;
             ways.push('search');
+            if (!targetEl) targetEl = searchEl;
         }
 
         // Check for sitemap link
@@ -1154,16 +1164,22 @@ async function checkMultipleWays(page) {
         }
 
         // Check for breadcrumbs
-        if (document.querySelector('[aria-label*="breadcrumb" i], [class*="breadcrumb"], nav ol')) {
+        const breadcrumbEl = document.querySelector('[aria-label*="breadcrumb" i], [class*="breadcrumb"], nav ol');
+        if (breadcrumbEl) {
             wayCount++;
             ways.push('breadcrumbs');
+            if (!targetEl) targetEl = breadcrumbEl;
         }
 
         // Check for table of contents / page index
-        if (document.querySelector('[class*="toc"], [id*="toc"], [class*="table-of-contents"]')) {
+        const tocEl = document.querySelector('[class*="toc"], [id*="toc"], [class*="table-of-contents"]');
+        if (tocEl) {
             wayCount++;
             ways.push('table of contents');
+            if (!targetEl) targetEl = tocEl;
         }
+
+        const selector = targetEl ? __getSelector(targetEl) : null;
 
         if (wayCount >= 2) {
             findings.push({
@@ -1171,6 +1187,7 @@ async function checkMultipleWays(page) {
                 status: 'pass',
                 message: `Found ${wayCount} navigation mechanisms: ${ways.join(', ')}.`,
                 impact: null,
+                selector,
             });
         } else {
             findings.push({
@@ -1178,6 +1195,7 @@ async function checkMultipleWays(page) {
                 status: 'warning',
                 message: `Only ${wayCount} navigation mechanism(s) detected${ways.length > 0 ? ': ' + ways.join(', ') : ''}. WCAG 2.4.5 requires at least two ways to locate a page (e.g., navigation, search, sitemap).`,
                 impact: 'moderate',
+                selector,
             });
         }
 
@@ -1280,7 +1298,7 @@ export async function runCustomChecks(browser, url) {
         await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
         await new Promise(r => setTimeout(r, 500));
 
-        // Inject selector helper for screenshot targeting
+        // Inject selector helper and shared-region detection
         await page.evaluate(() => {
             window.__getSelector = function(el) {
                 if (!el || el === document.body) return 'body';
@@ -1291,6 +1309,11 @@ export async function runCustomChecks(browser, url) {
                     el = el.parentNode;
                 }
                 return 'body > ' + path.join(' > ');
+            };
+            window.__isInSharedRegion = function(el) {
+                if (el.closest('[role="banner"], [role="contentinfo"]')) return true;
+                const shared = el.closest('header, footer, nav');
+                return shared ? !shared.closest('article, section, aside, main') : false;
             };
         });
 
@@ -1333,6 +1356,24 @@ export async function runCustomChecks(browser, url) {
         // Group D: Keyboard Simulation (must be sequential — interacts with page)
         const trapFindings = await checkNoKeyboardTrap(page);
         allFindings.push(...trapFindings);
+
+        // Tag findings inside shared regions (site-wide header/footer)
+        const sels = [...new Set(allFindings.filter(f => f.selector).map(f => f.selector))];
+        if (sels.length > 0) {
+            const sharedMap = await page.evaluate((selectors) => {
+                const map = {};
+                for (const sel of selectors) {
+                    try {
+                        const el = document.querySelector(sel);
+                        map[sel] = el ? __isInSharedRegion(el) : false;
+                    } catch { map[sel] = false; }
+                }
+                return map;
+            }, sels);
+            for (const f of allFindings) {
+                f.inSharedRegion = f.selector ? (sharedMap[f.selector] || false) : false;
+            }
+        }
 
         // Attach screenshots to findings that have selectors
         await attachScreenshots(page, allFindings);

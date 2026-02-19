@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WCAG Scanner Dashboard</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="app">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-brand">
+                <svg class="header-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="12" cy="12" r="10"/>
+                    <path d="M8 14s1.5 2 4 2 4-2 4-2"/>
+                    <line x1="9" y1="9" x2="9.01" y2="9"/>
+                    <line x1="15" y1="9" x2="15.01" y2="9"/>
+                </svg>
+                <h1>WCAG Scanner</h1>
+            </div>
+            <nav class="tabs">
+                <button class="tab active" data-tab="scan">New Scan</button>
+                <button class="tab" data-tab="history">History</button>
+                <button class="tab" data-tab="reports">Reports</button>
+            </nav>
+        </header>
+
+        <!-- Tab: New Scan -->
+        <section id="tab-scan" class="tab-content active">
+            <div class="card">
+                <h2 class="card-title">Configure Scan</h2>
+                <form id="scan-form" class="scan-form">
+                    <div class="form-row">
+                        <div class="form-group full">
+                            <label for="url">Website URL</label>
+                            <input type="url" id="url" name="url" placeholder="https://example.com" required>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="mode">Scan Mode</label>
+                            <select id="mode" name="mode">
+                                <option value="full">Full Site Crawl</option>
+                                <option value="custom">Custom URLs</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="level">WCAG Level</label>
+                            <select id="level" name="level">
+                                <option value="A">Level A</option>
+                                <option value="AA" selected>Level AA</option>
+                                <option value="AAA">Level AAA</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="form-row" id="crawl-options">
+                        <div class="form-group">
+                            <label for="depth">Crawl Depth</label>
+                            <input type="number" id="depth" name="depth" value="3" min="1" max="10">
+                        </div>
+                        <div class="form-group">
+                            <label for="maxPages">Max Pages</label>
+                            <input type="number" id="maxPages" name="maxPages" value="25" min="1" max="100">
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label class="toggle-label">
+                                <input type="checkbox" id="skipImages" name="skipImages">
+                                <span>Skip image analysis</span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <details class="advanced-options">
+                        <summary>Advanced Options</summary>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="llamaUrl">Llama Server URL</label>
+                                <input type="text" id="llamaUrl" name="llamaUrl" value="http://192.168.50.107:8080">
+                            </div>
+                            <div class="form-group">
+                                <label for="model">VLM Model</label>
+                                <input type="text" id="model" name="model" value="qwen3vl-8b-instruct">
+                            </div>
+                        </div>
+                    </details>
+
+                    <button type="submit" class="btn btn-primary" id="start-btn">
+                        Start Scan
+                    </button>
+                </form>
+            </div>
+        </section>
+
+        <!-- Tab: History -->
+        <section id="tab-history" class="tab-content">
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="card-title">Scan History</h2>
+                    <button class="btn btn-small" id="refresh-history">Refresh</button>
+                </div>
+                <div id="history-list" class="history-list">
+                    <p class="empty-state">No scans yet. Start a new scan to see results here.</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Tab: Reports -->
+        <section id="tab-reports" class="tab-content">
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="card-title">Generated Reports</h2>
+                    <button class="btn btn-small" id="refresh-reports">Refresh</button>
+                </div>
+                <div id="reports-list" class="reports-list">
+                    <p class="empty-state">No reports found. Run a scan to generate reports.</p>
+                </div>
+            </div>
+        </section>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

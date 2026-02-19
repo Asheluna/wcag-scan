@@ -5,7 +5,7 @@
 import { readFileSync } from 'fs';
 import { writeFile } from 'fs/promises';
 import path from 'path';
-import { getSeverityColor, getSeverityWeight, formatTimestamp, truncate, calculateScore } from './utils.js';
+import { getSeverityColor, getSeverityWeight, formatTimestamp, truncate } from './utils.js';
 import { WCAG_PRINCIPLES, parseWcagTag, buildCriteriaLookup } from './wcagCriteria.js';
 
 // Criteria that require manual human review — no automated test is reliable enough
@@ -52,6 +52,51 @@ const MANUAL_REVIEW_GUIDANCE = {
 };
 
 /**
+ * Compute criteria-level summary from scan results.
+ * Returns { total, passed, failed, review, manual, notApplicable, notTested, score }.
+ * `passed` includes not-applicable criteria.
+ */
+export function computeCriteriaSummary(scanResults, imageResults, customResults) {
+    const wcagData = aggregateByWcag(scanResults, imageResults, customResults);
+    const cc = countCriteriaStatuses(wcagData);
+    const passed = cc.pass + cc.notApplicable;
+    const tested = passed + cc.fail + cc.review;
+    return {
+        total: cc.total,
+        passed,
+        failed: cc.fail,
+        review: cc.review,
+        manual: cc.manual,
+        notApplicable: cc.notApplicable,
+        notTested: cc.notTested,
+        score: tested > 0 ? Math.round((passed / tested) * 100) : 0,
+    };
+}
+
+/**
+ * Count criteria by status from the aggregated WCAG data.
+ * Returns { total, pass, fail, review, manual, notApplicable, notTested, tested }.
+ * `tested` = pass + fail + review (criteria with actual test results).
+ */
+function countCriteriaStatuses(wcagData) {
+    let total = 0, pass = 0, fail = 0, review = 0, manual = 0, notApplicable = 0, notTested = 0;
+    for (const p of wcagData.principles) {
+        for (const g of p.guidelines) {
+            for (const c of g.criteria) {
+                total++;
+                if (c.status === 'pass') pass++;
+                else if (c.status === 'fail') fail++;
+                else if (c.status === 'needs-review') review++;
+                else if (c.status === 'manual-review') manual++;
+                else if (c.status === 'not-applicable') notApplicable++;
+                else notTested++;
+            }
+        }
+    }
+    return { total, pass, fail, review, manual, notApplicable, notTested, tested: pass + fail + review };
+}
+
+/**
  * Aggregate scan results, image findings, and custom check findings into the WCAG 2.2 hierarchy.
  */
 function aggregateByWcag(scanResults, imageResults, customResults) {
@@ -90,6 +135,14 @@ function aggregateByWcag(scanResults, imageResults, customResults) {
                         const existing = targetMap.get(rule.id);
                         existing.pageCount++;
                         existing.pages.push(pageResult.url);
+                        if (rule.nodes?.length > 0 && existing.nodes) {
+                            // Deduplicate shared-region nodes (header/footer)
+                            const hasSharedNodes = existing.nodes.some(n => n.inSharedRegion);
+                            for (const node of rule.nodes) {
+                                if (node.inSharedRegion && hasSharedNodes) continue;
+                                existing.nodes.push(node);
+                            }
+                        }
                     }
                 } else {
                     for (const criterionId of criterionIds) {
@@ -101,6 +154,14 @@ function aggregateByWcag(scanResults, imageResults, customResults) {
                             const existing = map.get(rule.id);
                             existing.pageCount++;
                             existing.pages.push(pageResult.url);
+                            // Merge nodes, deduplicating shared-region nodes (header/footer)
+                            if (rule.nodes?.length > 0 && existing.nodes) {
+                                const hasSharedNodes = existing.nodes.some(n => n.inSharedRegion);
+                                for (const node of rule.nodes) {
+                                    if (node.inSharedRegion && hasSharedNodes) continue;
+                                    existing.nodes.push(node);
+                                }
+                            }
                         }
                     }
                 }
@@ -108,34 +169,38 @@ function aggregateByWcag(scanResults, imageResults, customResults) {
         }
     }
 
-    // Slot image findings under their WCAG criteria
+    // Slot image findings under their WCAG criteria (dedup shared-region findings)
     if (imageResults) {
         for (const pageResult of imageResults) {
             for (const finding of pageResult.findings || []) {
                 const criterionId = finding.wcagCriteria;
-                if (criteriaResults[criterionId]) {
-                    criteriaResults[criterionId].imageFindings.push({
-                        ...finding,
-                        pageUrl: pageResult.url,
-                    });
+                if (!criteriaResults[criterionId]) continue;
+                const target = criteriaResults[criterionId].imageFindings;
+                if (finding.inSharedRegion) {
+                    const already = target.some(f => f.inSharedRegion && f.src === finding.src);
+                    if (already) continue;
                 }
+                target.push({ ...finding, pageUrl: pageResult.url });
             }
         }
     }
 
-    // Slot custom check findings under their WCAG criteria
+    // Slot custom check findings under their WCAG criteria (dedup shared-region findings)
     if (customResults) {
         const { perPage, crossPage } = customResults;
         // Per-page findings
         for (const pageResult of perPage || []) {
             for (const finding of pageResult.findings || []) {
                 const criterionId = finding.criterionId;
-                if (criteriaResults[criterionId]) {
-                    criteriaResults[criterionId].customFindings.push({
-                        ...finding,
-                        pageUrl: pageResult.url,
-                    });
+                if (!criteriaResults[criterionId]) continue;
+                const target = criteriaResults[criterionId].customFindings;
+                if (finding.inSharedRegion) {
+                    const already = target.some(
+                        f => f.inSharedRegion && f.criterionId === criterionId && f.status === finding.status
+                    );
+                    if (already) continue;
                 }
+                target.push({ ...finding, pageUrl: pageResult.url });
             }
         }
         // Cross-page findings (not page-specific)
@@ -227,33 +292,19 @@ function aggregateByWcag(scanResults, imageResults, customResults) {
  * Generate the WCAG-structured HTML section.
  */
 function generateWcagSection(wcagData) {
-    // Count criteria by status
-    let totalCriteria = 0, passCount = 0, failCount = 0, reviewCount = 0, manualCount = 0, notTestedCount = 0, notApplicableCount = 0;
-    for (const p of wcagData.principles) {
-        for (const g of p.guidelines) {
-            for (const c of g.criteria) {
-                totalCriteria++;
-                if (c.status === 'pass') passCount++;
-                else if (c.status === 'fail') failCount++;
-                else if (c.status === 'needs-review') reviewCount++;
-                else if (c.status === 'manual-review') manualCount++;
-                else if (c.status === 'not-applicable') notApplicableCount++;
-                else notTestedCount++;
-            }
-        }
-    }
+    const cc = countCriteriaStatuses(wcagData);
 
     let html = `
     <section class="section wcag-structure">
       <h2>WCAG 2.2 Compliance Overview</h2>
       <p class="section-desc">
-        ${totalCriteria} required criteria (Norwegian regulations) ·
-        <span style="color:var(--success)">${passCount} passed</span> ·
-        <span style="color:var(--danger)">${failCount} failed</span> ·
-        <span style="color:var(--warning)">${reviewCount} needs review</span>
-        ${notApplicableCount > 0 ? `· <span style="color:var(--text-muted)">${notApplicableCount} not applicable</span>` : ''}
-        ${manualCount > 0 ? `· <span style="color:var(--info)">${manualCount} manual review</span>` : ''}
-        ${notTestedCount > 0 ? `· <span style="color:var(--text-muted)">${notTestedCount} not tested</span>` : ''}
+        ${cc.total} required criteria (Norwegian regulations) ·
+        <span style="color:var(--success)">${cc.pass} passed</span> ·
+        <span style="color:var(--danger)">${cc.fail} failed</span> ·
+        <span style="color:var(--warning)">${cc.review} needs review</span>
+        ${cc.notApplicable > 0 ? `· <span style="color:var(--text-muted)">${cc.notApplicable} not applicable</span>` : ''}
+        ${cc.manual > 0 ? `· <span style="color:var(--info)">${cc.manual} manual review</span>` : ''}
+        ${cc.notTested > 0 ? `· <span style="color:var(--text-muted)">${cc.notTested} not tested</span>` : ''}
       </p>
     `;
 
@@ -355,6 +406,20 @@ function generateWcagSection(wcagData) {
                 </div>
                 <p>${escapeHtml(v.description)}</p>
                 ${v.helpUrl ? `<a href="${v.helpUrl}" target="_blank" class="help-link">Learn more ↗</a>` : ''}
+                ${v.nodes?.length > 0 ? `
+                <details class="affected-elements">
+                  <summary>${v.nodes.length} affected element${v.nodes.length > 1 ? 's' : ''}</summary>
+                  ${v.nodes.slice(0, 5).map(n => `
+                  <div class="element-item">
+                    <code>${escapeHtml(truncate(n.html, 150))}</code>
+                    ${n.failureSummary ? `<p class="fix-suggestion">${escapeHtml(n.failureSummary)}</p>` : ''}
+                    ${n.target?.length > 0 ? `<p class="selector">Selector: <code>${escapeHtml(n.target.join(' > '))}</code></p>` : ''}
+                    ${n.screenshot ? `<div class="finding-screenshot">
+                      <img src="${n.screenshot}" alt="Screenshot of affected element" loading="lazy" />
+                    </div>` : ''}
+                  </div>`).join('')}
+                  ${v.nodes.length > 5 ? `<p class="more-items">...and ${v.nodes.length - 5} more</p>` : ''}
+                </details>` : ''}
               </div>`;
                     }
                 }
@@ -371,7 +436,9 @@ function generateWcagSection(wcagData) {
                   <span class="finding-type">${f.type}</span>
                 </div>
                 <p class="finding-message">${escapeHtml(f.message)}</p>
-                ${f.detectedText ? `<div class="code-snippet"><strong>Detected text:</strong> "${escapeHtml(truncate(f.detectedText, 200))}" <span class="confidence">(${f.confidence}% confidence)</span></div>` : ''}
+                ${f.vlmDescription ? `<div class="code-snippet"><strong>Image shows:</strong> ${escapeHtml(truncate(f.vlmDescription, 200))}</div>` : ''}
+                ${f.detectedText ? `<div class="code-snippet"><strong>Detected text:</strong> "${escapeHtml(truncate(f.detectedText, 200))}"</div>` : ''}
+                ${f.contentType ? `<div class="code-snippet"><strong>Type:</strong> ${escapeHtml(f.contentType)}</div>` : ''}
                 ${f.src ? `<div class="code-snippet"><strong>Source:</strong> ${escapeHtml(truncate(f.src, 100))}</div>` : ''}
                 <div class="code-snippet"><strong>Page:</strong> ${escapeHtml(f.pageUrl)}</div>
                 ${f.screenshot ? `<div class="finding-screenshot">
@@ -442,15 +509,21 @@ function generateWcagSection(wcagData) {
                 }
 
                 if (customPasses.length > 0 && criterion.passes.length === 0) {
-                    // Show custom pass info only if no axe-core passes (avoid duplication)
+                    // Deduplicate identical pass messages (e.g. same check run on N pages)
+                    const passMessageCounts = new Map();
+                    for (const f of customPasses) {
+                        passMessageCounts.set(f.message, (passMessageCounts.get(f.message) || 0) + 1);
+                    }
+                    const uniquePassMessages = Array.from(passMessageCounts.entries());
+
                     html += `
             <details class="passes-section">
-              <summary><h5 style="display:inline" class="criterion-subheading">${customPasses.length} Passed Custom Check${customPasses.length > 1 ? 's' : ''}</h5></summary>
+              <summary><h5 style="display:inline" class="criterion-subheading">${uniquePassMessages.length} Passed Custom Check${uniquePassMessages.length > 1 ? 's' : ''}</h5></summary>
               <div class="passes-list">
-                ${customPasses.map(f => `
+                ${uniquePassMessages.map(([msg, count]) => `
                 <div class="pass-item">
                   <span class="check">✓</span>
-                  <span>${escapeHtml(f.message)}</span>
+                  <span>${escapeHtml(msg)}${count > 1 ? ` <span class="page-count">(${count} pages)</span>` : ''}</span>
                 </div>`).join('')}
               </div>
             </details>`;
@@ -506,6 +579,21 @@ function generateWcagSection(wcagData) {
               <span class="page-count">${v.pageCount} page${v.pageCount > 1 ? 's' : ''}</span>
             </div>
             <p>${escapeHtml(v.description)}</p>
+            ${v.helpUrl ? `<a href="${v.helpUrl}" target="_blank" class="help-link">Learn more ↗</a>` : ''}
+            ${v.nodes?.length > 0 ? `
+            <details class="affected-elements">
+              <summary>${v.nodes.length} affected element${v.nodes.length > 1 ? 's' : ''}</summary>
+              ${v.nodes.slice(0, 5).map(n => `
+              <div class="element-item">
+                <code>${escapeHtml(truncate(n.html, 150))}</code>
+                ${n.failureSummary ? `<p class="fix-suggestion">${escapeHtml(n.failureSummary)}</p>` : ''}
+                ${n.target?.length > 0 ? `<p class="selector">Selector: <code>${escapeHtml(n.target.join(' > '))}</code></p>` : ''}
+                ${n.screenshot ? `<div class="finding-screenshot">
+                  <img src="${n.screenshot}" alt="Screenshot of affected element" loading="lazy" />
+                </div>` : ''}
+              </div>`).join('')}
+              ${v.nodes.length > 5 ? `<p class="more-items">...and ${v.nodes.length - 5} more</p>` : ''}
+            </details>` : ''}
           </div>`;
             }
         }
@@ -543,7 +631,6 @@ export function generateHtmlReport(scanResults, imageResults, customResults, opt
         brandLogo = '',
     } = options;
 
-    const score = calculateScore(scanResults);
     const totalViolations = scanResults.reduce((sum, r) => sum + (r.violations?.length || 0), 0);
     const totalPasses = scanResults.reduce((sum, r) => sum + (r.passes?.length || 0), 0);
     const totalIncomplete = scanResults.reduce((sum, r) => sum + (r.incomplete?.length || 0), 0);
@@ -559,6 +646,14 @@ export function generateHtmlReport(scanResults, imageResults, customResults, opt
 
     // Aggregate results by WCAG structure
     const wcagData = aggregateByWcag(scanResults, imageResults, customResults);
+
+    // Count criteria by status for score calculation
+    // Not-applicable criteria count as passed (no relevant content = no violation)
+    const criteriaCounts = countCriteriaStatuses(wcagData);
+    const passedTotal = criteriaCounts.pass + criteriaCounts.notApplicable;
+    const score = criteriaCounts.tested > 0
+        ? Math.round((passedTotal / (criteriaCounts.tested + criteriaCounts.notApplicable)) * 100)
+        : 0;
 
     const timestamp = formatTimestamp(new Date());
 
@@ -593,6 +688,7 @@ export function generateHtmlReport(scanResults, imageResults, customResults, opt
         <div class="score-ring ${score >= 80 ? 'good' : score >= 50 ? 'moderate' : 'poor'}">
           <span class="score-value">${score}</span>
         </div>
+        <div class="score-fraction">${passedTotal}/${criteriaCounts.total} criteria passed</div>
         <div class="score-label">Compliance Score</div>
       </div>
       <div class="stats-grid">
@@ -903,6 +999,7 @@ function getReportCSS() {
     .score-ring.good { border-color: var(--success); color: var(--success); }
     .score-ring.moderate { border-color: var(--warning); color: var(--warning); }
     .score-ring.poor { border-color: var(--danger); color: var(--danger); }
+    .score-fraction { color: var(--text); font-size: 15px; font-weight: 700; margin-bottom: 2px; }
     .score-label { color: var(--text-muted); font-size: 13px; font-weight: 600; }
 
     .stats-grid {
